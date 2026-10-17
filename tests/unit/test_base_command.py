@@ -3,12 +3,16 @@ import os
 import time
 from optparse import Values
 from pathlib import Path
-from typing import Callable, Iterator, List, NoReturn, Optional
+from typing import Any, Callable, Iterator, List, NoReturn, Optional
 from unittest.mock import Mock, patch
 
 import pytest
+from pip._vendor.packaging.version import Version
 
+from pip._internal import self_outdated_check
+from pip._internal.cli import cmdoptions
 from pip._internal.cli.base_command import Command
+from pip._internal.cli.req_command import IndexGroupCommand
 from pip._internal.cli.status_codes import SUCCESS
 from pip._internal.utils import temp_dir
 from pip._internal.utils.logging import BrokenStdoutLoggingError
@@ -57,6 +61,35 @@ class FakeCommandWithUnicode(FakeCommand):
         return SUCCESS
 
 
+class FakeIndexGroupCommand(IndexGroupCommand):
+    """A command that does the pip self version check, like ``pip install``."""
+
+    _name = "fake_index_group"
+
+    def __init__(self, run_func: Callable[[], int]) -> None:
+        self.run_func = run_func
+        super().__init__(self._name, self._name)
+
+    def add_options(self) -> None:
+        index_opts = cmdoptions.make_option_group(cmdoptions.index_group, self.parser)
+        self.parser.insert_option_group(0, index_opts)
+
+    def run(self, options: Values, args: List[str]) -> int:
+        return self.run_func()
+
+
+@pytest.fixture
+def enable_pip_version_check(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The test suite disables the pip self version check by default.
+    monkeypatch.setenv("PIP_DISABLE_PIP_VERSION_CHECK", "no")
+    # Keep Command.main() from attaching logging handlers to pytest's
+    # (short-lived) capture streams, which would leak into later tests.
+    monkeypatch.setattr(
+        "pip._internal.cli.base_command.setup_logging",
+        lambda **kwargs: logging.INFO,
+    )
+
+
 class TestCommand:
     def call_main(self, capsys: pytest.CaptureFixture[str], args: List[str]) -> str:
         """
@@ -93,14 +126,135 @@ class TestCommand:
         assert "Traceback (most recent call last):" in stderr
 
 
-@patch("pip._internal.cli.req_command.Command.handle_pip_version_check")
-def test_handle_pip_version_check_called(mock_handle_version_check: Mock) -> None:
+@patch("pip._internal.cli.req_command.Command.pip_version_check")
+def test_pip_version_check_called(mock_version_check: Mock) -> None:
     """
-    Check that Command.handle_pip_version_check() is called.
+    Check that ``Command.pip_version_check()`` wraps the command body.
     """
     cmd = FakeCommand()
     cmd.main([])
-    mock_handle_version_check.assert_called_once()
+    mock_version_check.assert_called_once()
+
+
+@patch("pip._internal.cli.req_command.pip_self_version_check_emit")
+@patch("pip._internal.cli.req_command.pip_self_version_check_fetch")
+def test_pip_version_check_fetches_before_command_body(
+    mock_fetch: Mock, mock_emit: Mock, enable_pip_version_check: None
+) -> None:
+    """
+    The remote pip version is fetched before the command body runs, and the
+    upgrade prompt is only emitted after it.
+    """
+    events: List[str] = []
+
+    def fetch(session: Any, options: Values) -> str:
+        events.append("fetch")
+        return "2.0"
+
+    def emit(remote_version_str: Optional[str]) -> None:
+        events.append("emit")
+
+    mock_fetch.side_effect = fetch
+    mock_emit.side_effect = emit
+
+    def run_body() -> int:
+        events.append("body")
+        return SUCCESS
+
+    cmd = FakeIndexGroupCommand(run_func=run_body)
+    assert cmd.main(["--no-cache-dir"]) == SUCCESS
+
+    assert events == ["fetch", "body", "emit"]
+    mock_fetch.assert_called_once()
+    mock_emit.assert_called_once_with("2.0")
+
+
+@patch("pip._internal.cli.req_command.pip_self_version_check_emit")
+@patch("pip._internal.cli.req_command.pip_self_version_check_fetch")
+def test_pip_version_check_fetch_error_does_not_stop_command(
+    mock_fetch: Mock,
+    mock_emit: Mock,
+    enable_pip_version_check: None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    An error while fetching the remote pip version is reported as a warning,
+    the command body still runs and nothing is emitted afterwards.
+    """
+    mock_fetch.side_effect = RuntimeError("boom")
+    run_body = Mock(return_value=SUCCESS)
+
+    cmd = FakeIndexGroupCommand(run_func=run_body)
+    with caplog.at_level(logging.WARNING):
+        assert cmd.main(["--no-cache-dir"]) == SUCCESS
+
+    run_body.assert_called_once()
+    mock_emit.assert_not_called()
+    assert "There was an error checking the latest version of pip." in caplog.messages
+
+
+@patch("pip._internal.cli.req_command.pip_self_version_check_emit")
+@patch("pip._internal.cli.req_command.pip_self_version_check_fetch")
+def test_pip_version_check_disabled(
+    mock_fetch: Mock, mock_emit: Mock, enable_pip_version_check: None
+) -> None:
+    """
+    Neither phase of the check runs when it is disabled.
+    """
+    run_body = Mock(return_value=SUCCESS)
+
+    cmd = FakeIndexGroupCommand(run_func=run_body)
+    assert cmd.main(["--no-cache-dir", "--disable-pip-version-check"]) == SUCCESS
+
+    run_body.assert_called_once()
+    mock_fetch.assert_not_called()
+    mock_emit.assert_not_called()
+
+
+def test_pip_version_check_does_not_run_code_replaced_by_command(
+    enable_pip_version_check: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    The pip self version check must not run pip code after the command body:
+    the command (e.g. ``pip install``) may have overwritten pip's own modules,
+    which would then be executed by pip itself (CVE-2026-6357).
+    """
+    events: List[str] = []
+
+    def get_remote_pip_version(session: Any, options: Values) -> str:
+        events.append("fetch")
+        return "1.0"
+
+    def overwritten_get_remote_pip_version(*args: Any, **kwargs: Any) -> str:
+        events.append("overwritten code executed")
+        return "1.0"
+
+    def run_body() -> int:
+        events.append("body")
+        # Simulate the command replacing the pip code the version check uses.
+        monkeypatch.setattr(
+            self_outdated_check,
+            "_get_current_remote_pip_version",
+            overwritten_get_remote_pip_version,
+        )
+        return SUCCESS
+
+    installed_pip = Mock(version=Version("1.0"), installer="pip")
+    monkeypatch.setattr(
+        self_outdated_check,
+        "get_default_environment",
+        lambda: Mock(get_distribution=Mock(return_value=installed_pip)),
+    )
+    monkeypatch.setattr(
+        self_outdated_check, "_get_current_remote_pip_version", get_remote_pip_version
+    )
+
+    cmd = FakeIndexGroupCommand(run_func=run_body)
+    assert cmd.main(["--no-cache-dir"]) == SUCCESS
+
+    # The remote version is fetched before the command body runs, and nothing
+    # replaced by the command body is executed afterwards.
+    assert events == ["fetch", "body"]
 
 
 def test_log_command_success(fixed_time: None, tmpdir: Path) -> None:

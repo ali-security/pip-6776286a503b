@@ -78,16 +78,16 @@ def test_index_group_commands() -> None:
 @pytest.mark.parametrize(
     "disable_pip_version_check, no_index, expected_called",
     [
-        # pip_self_version_check() is only called when both
-        # disable_pip_version_check and no_index are False.
+        # The fetch phase only runs when both disable_pip_version_check
+        # and no_index are False.
         (False, False, True),
         (False, True, False),
         (True, False, False),
         (True, True, False),
     ],
 )
-@mock.patch("pip._internal.cli.req_command.pip_self_version_check")
-def test_index_group_handle_pip_version_check(
+@mock.patch("pip._internal.cli.req_command.pip_self_version_check_fetch")
+def test_index_group_pip_version_check(
     mock_version_check: mock.Mock,
     command_name: str,
     disable_pip_version_check: bool,
@@ -95,16 +95,18 @@ def test_index_group_handle_pip_version_check(
     expected_called: bool,
 ) -> None:
     """
-    Test whether pip_self_version_check() is called when
-    handle_pip_version_check() is called, for each of the
-    IndexGroupCommand classes.
+    Test whether the pre-body fetch runs when ``pip_version_check()`` is
+    entered, for each of the IndexGroupCommand classes.
     """
     command = create_command(command_name)
     options = command.parser.get_default_values()
     options.disable_pip_version_check = disable_pip_version_check
     options.no_index = no_index
+    # Return None so the emit branch is a no-op.
+    mock_version_check.return_value = None
 
-    command.handle_pip_version_check(options)
+    with command.pip_version_check(options):
+        pass
     if expected_called:
         mock_version_check.assert_called_once()
     else:
