@@ -10,7 +10,7 @@ import pytest
 
 from pip._internal.exceptions import HashMismatch
 from pip._internal.models.link import Link
-from pip._internal.network.download import Downloader
+from pip._internal.network.download import BatchDownloader, Downloader
 from pip._internal.network.session import PipSession
 from pip._internal.operations.prepare import unpack_url
 from pip._internal.utils.hashes import Hashes
@@ -86,6 +86,43 @@ def test_download_http_url__no_directory_traversal(
     actual = os.listdir(download_dir)
     assert actual == ["out_dir_file"]
     mock_raise_for_status.assert_called_once_with(resp)
+
+
+@pytest.mark.parametrize("use_batch_downloader", [False, True])
+def test_download_http_url__no_directory_traversal_double_encoded_url(
+    tmpdir: Path, use_batch_downloader: bool
+) -> None:
+    """
+    Test that directory traversal doesn't happen on download when the URL
+    path carries a doubly percent-encoded "../". The path is decoded only
+    once, so the encoded separator stays part of a single file name.
+    """
+    mock_url = "http://www.example.com/%252e%252e%252fout_dir_file.tgz"
+    contents = b"downloaded"
+    link = Link(mock_url)
+
+    session = Mock()
+    resp = MockResponse(contents)
+    resp.url = mock_url
+    resp.headers = {
+        # Set the content-type to a random value to prevent
+        # mimetypes.guess_extension from guessing the extension.
+        "content-type": "random",
+    }
+    session.get.return_value = resp
+
+    download_dir = os.fspath(tmpdir.joinpath("download"))
+    os.mkdir(download_dir)
+    if use_batch_downloader:
+        batch_download = BatchDownloader(session, progress_bar="on")
+        ((_, (file_path, _)),) = list(batch_download([link], download_dir))
+    else:
+        download = Downloader(session, progress_bar="on")
+        file_path, _ = download(link, download_dir)
+    # The file should be downloaded to download_dir, not to its parent.
+    assert os.listdir(download_dir) == ["%2e%2e%2fout_dir_file.tgz"]
+    assert os.path.dirname(file_path) == download_dir
+    assert not os.path.exists(tmpdir.joinpath("out_dir_file.tgz"))
 
 
 @pytest.fixture
